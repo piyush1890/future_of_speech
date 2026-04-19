@@ -1,0 +1,37 @@
+# Data (44GB — features, alignments, tokens)
+data/
+
+# Checkpoints (hundreds of MB, individual files exceed GitHub 100MB limit)
+checkpoints/
+checkpoints_*/
+
+# Generated audio samples
+outputs/
+
+# Logs
+*.log
+nohup.out
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Env
+.venv/
+venv/
+env/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
