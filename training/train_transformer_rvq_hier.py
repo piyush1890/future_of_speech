@@ -48,11 +48,16 @@ def train(args):
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_tts_rvq, num_workers=0,
+        collate_fn=collate_tts_rvq,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_tts_rvq, num_workers=0,
+        collate_fn=collate_tts_rvq,
+        num_workers=max(1, args.num_workers // 2) if args.num_workers > 0 else 0,
+        persistent_workers=args.num_workers > 0,
     )
 
     model = ArticulatoryTTSModelRVQHier(
@@ -197,6 +202,7 @@ def train(args):
 
         model.eval()
         val_ce = 0
+        val_ce_per_level = [0.0] * args.num_quantizers
         val_acc_per_level = [0] * args.num_quantizers
 
         with torch.no_grad():
@@ -228,6 +234,7 @@ def train(args):
                     target_k = vq_tokens[:, :T, k]
                     ce = ce_loss_fn(logits_k.reshape(-1, C), target_k.reshape(-1)).reshape(B, T)
                     ce_masked = (ce * mask_t).sum() / mask_t.sum().clamp(min=1)
+                    val_ce_per_level[k] += ce_masked.item()
                     val_ce += (level_weights[k] * ce_masked).item()
 
                     pred = logits_k.argmax(dim=-1)
@@ -236,12 +243,13 @@ def train(args):
 
         vn = len(val_loader)
 
+        ce_strs = " ".join(f"CE{k}={val_ce_per_level[k]/vn:.3f}" for k in range(K))
         acc_strs = " ".join(f"L{k}={val_acc_per_level[k]/vn:.1%}" for k in range(K))
         print(
             f"Epoch {epoch:3d} | "
             f"Train: CE={train_ce_total/n:.4f} dur={train_dur/n:.4f} | "
-            f"Val: CE={val_ce/vn:.4f} | "
-            f"Val Acc: {acc_strs} | "
+            f"Val: CE={val_ce/vn:.4f} ({ce_strs}) | "
+            f"Acc: {acc_strs} | "
             f"LR: {optimizer.param_groups[0]['lr']:.6f}"
         )
 
@@ -274,8 +282,9 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_rvq_hier")
     parser.add_argument("--init-from", type=str, default="",
                         help="Path to flat checkpoint to init weights from (partial load, cb_embeds zero-init)")
-    parser.add_argument("--restore-optim", action="store_true",
-                        help="When resuming, restore optimizer+scheduler state (only for hier checkpoints)")
+    parser.add_argument("--no-restore-optim", dest="restore_optim", action="store_false",
+                        help="When resuming, DON'T restore optimizer+scheduler (re-warmup from step 0)")
+    parser.set_defaults(restore_optim=True)
     parser.add_argument("--device", type=str, default="mps")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=50)
@@ -293,6 +302,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--level-weights", type=str, default="",
                         help="Comma-sep weights per level, e.g. '1,1,1,1' (default uniform)")
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="DataLoader workers. 0 = serial on main process (slow on MPS).")
     args = parser.parse_args()
 
     train(args)
