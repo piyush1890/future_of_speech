@@ -50,11 +50,12 @@ class VQDataset(Dataset):
         data = np.load(npz_path)
 
         ema = data["ema"]       # (T, 12)
-        pitch = data["pitch"]   # (T,)
-        loudness = data["loudness"]  # (T,)
+        pitch = data["pitch"].squeeze()   # ensure 1D
+        loudness = data["loudness"].squeeze()  # ensure 1D
+        T = min(ema.shape[0], pitch.shape[0], loudness.shape[0])
 
         # Concatenate to 14-dim
-        features = np.concatenate([ema, pitch[:, None], loudness[:, None]], axis=-1)  # (T, 14)
+        features = np.concatenate([ema[:T], pitch[:T, None], loudness[:T, None]], axis=-1)  # (T, 14)
 
         # Extract chunk
         end = min(start + self.chunk_frames, features.shape[0])

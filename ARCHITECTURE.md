@@ -243,6 +243,112 @@ SPARC features are language-independent. Same RVQ codebook serves both (retrain 
 
 ## Key Learnings
 
+---
+
+## Adding New Data — Mandatory Checklist
+
+Every time new audio data is added to the training set, ALL steps must be followed in order. Skipping any step causes silent corruption that surfaces as slurred/broken audio.
+
+### Step 1: SPARC Encode
+```bash
+# Encode raw audio → {ema, pitch, loudness, spk_emb}.npz
+# Use Colab GPU for speed. Save to Drive.
+# VERIFY: each .npz has keys: ema(T,12), pitch(T,), loudness(T,), spk_emb(64,)
+```
+
+### Step 2: Log-Pitch Transform + Merge
+```bash
+python scripts/merge_features_logpitch_v2.py \
+  --sources data/NEW_FEATURES_DIR \
+  --out-dir data/features_merged_logpitch_v2 \
+  --skip-existing
+```
+**This recomputes `norm_stats.npz`** over the FULL merged set. The mean/std WILL change. This is expected and necessary.
+
+### Step 3: Retrain RVQ Codebook ⚠️ CRITICAL
+```bash
+python training/train_vq_rvq.py \
+  --features-dir data/features_merged_logpitch_v2 \
+  --checkpoint-dir checkpoints_rvq_logpitch_v2 \
+  --device mps --epochs 100 --batch-size 32
+```
+**The RVQ codebook MUST be retrained when norm_stats change.** The codebook entries represent the normalized feature distribution. If the distribution shifts (new data changes mean/std), old codebook entries are misaligned → coarse quantization → slurred output.
+
+**DO NOT skip this step.** It takes ~2-3 hours. Skipping it silently degrades ALL downstream quality.
+
+### Step 4: Re-Tokenize ALL Features
+```bash
+python training/tokenize_features_rvq.py \
+  --features-dir data/features_merged_logpitch_v2 \
+  --checkpoint checkpoints_rvq_logpitch_v2/rvq_best.pt \
+  --output-dir data/rvq_tokens_logpitch_v3 \
+  --device mps
+```
+**Must use the NEW RVQ checkpoint.** Must tokenize ALL files (not just new ones) because the codebook changed.
+
+### Step 5: Build Phonemes + Alignments
+```bash
+# For MFA-aligned data (LibriSpeech, ESD):
+python data/build_mfa_dataset.py \
+  --features-dir data/features_merged_logpitch_v2 \
+  --textgrid-dir data/mfa_alignments \
+  --output-dir data/processed_merged_vN
+
+# For g2p-aligned data (Expresso, etc.):
+# Custom script per dataset, merge JSONs
+```
+
+### Step 6: Verify Before Training
+```bash
+python -c "
+import json, numpy as np
+# Check counts match
+features = len(list(Path('data/features_merged_logpitch_v2').glob('*.npz'))) - 1  # minus norm_stats
+tokens = len(list(Path('data/rvq_tokens_logpitch_v3').glob('*.npy')))
+phonemes = len(json.load(open('data/processed_merged_vN/phonemes_mfa.json')))
+print(f'Features: {features}, Tokens: {tokens}, Phonemes: {phonemes}')
+assert abs(features - tokens) < 10, 'Feature/token count mismatch!'
+assert abs(features - phonemes) < 1000, 'Feature/phoneme count mismatch!'
+
+# Check norm_stats are reasonable
+ns = np.load('data/features_merged_logpitch_v2/norm_stats.npz')
+pitch_mean = ns['mean'][12]
+pitch_std = ns['std'][12]
+print(f'Pitch: mean={pitch_mean:.2f} (expect ~5.0), std={pitch_std:.2f} (expect ~0.4)')
+assert 4.5 < pitch_mean < 5.5, f'Pitch mean {pitch_mean} looks wrong!'
+assert 0.2 < pitch_std < 1.0, f'Pitch std {pitch_std} looks wrong!'
+print('All checks passed')
+"
+```
+
+### Step 7: Update Training Script
+```bash
+# Update ALL paths in train_hier_v3_style_smooth.sh:
+#   --features-dir    → new merged dir
+#   --phonemes-path   → new phonemes JSON
+#   --alignments-path → new alignments JSON
+#   --vq-tokens-dir   → new tokens dir (from new RVQ)
+#   --rvq-checkpoint  → new RVQ checkpoint
+```
+
+### Step 8: Train Transformer (from scratch)
+Since RVQ changed, old transformer checkpoints are incompatible. Start fresh.
+
+### Common Shape Bug
+SPARC can produce ema, pitch, loudness with off-by-one frame counts. EVERY file that reads .npz features must do:
+```python
+ema = data["ema"]
+pitch = data["pitch"].squeeze()      # ensure 1D
+loudness = data["loudness"].squeeze() # ensure 1D
+T = min(ema.shape[0], pitch.shape[0], loudness.shape[0])
+features = np.concatenate([ema[:T], pitch[:T, None], loudness[:T, None]], axis=1)
+```
+**Files that need this guard**: `dataset.py`, `dataset_rvq.py`, `tokenize_features_rvq.py`, `merge_features_logpitch_v2.py`, any new script that loads .npz features.
+
+---
+
+## Key Learnings
+
 1. **Pitch smoothness is physics**: frame-to-frame jumps physically impossible. Must be in training loss, not just post-processing.
 2. **CE undertreats pitch**: 1 dim out of 14 = ~2-5% of gradient. Smoothness loss with weight 3.0 fixes this.
 3. **Style ≠ emotion ≠ speaker**: three separate conditioning dimensions (spk_emb, style_vec, future emotion tokens).
