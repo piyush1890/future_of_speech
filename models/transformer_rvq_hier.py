@@ -34,6 +34,7 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         d_ff: int = 1024,
         dropout: float = 0.1,
         speaker_emb_dim: int = 64,
+        style_dim: int = None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -50,6 +51,9 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
 
         self.speaker_proj = nn.Linear(speaker_emb_dim, d_model)
+        self.style_proj = nn.Linear(style_dim if style_dim is not None else d_model, d_model)
+        nn.init.zeros_(self.style_proj.weight)
+        nn.init.zeros_(self.style_proj.bias)
         self.duration_predictor = DurationPredictor(d_model, dropout=dropout)
         self.length_regulator = LengthRegulator()
 
@@ -73,11 +77,14 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         for emb in self.cb_embeds:
             nn.init.zeros_(emb.weight)
 
-    def encode_phonemes(self, phoneme_ids, speaker_emb, phoneme_mask=None):
+    def encode_phonemes(self, phoneme_ids, speaker_emb, phoneme_mask=None,
+                        style_vec=None):
         x = self.phoneme_embedding(phoneme_ids)
         x = self.encoder_pe(x)
         spk = self.speaker_proj(speaker_emb).unsqueeze(1)
         x = x + spk
+        if style_vec is not None:
+            x = x + self.style_proj(style_vec).unsqueeze(1)
         padding_mask = ~phoneme_mask if phoneme_mask is not None else None
         x = self.encoder(x, src_key_padding_mask=padding_mask)
         return x
@@ -129,8 +136,10 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         target_len: int = None,
         phoneme_mask: torch.Tensor = None,
         target_tokens: torch.Tensor = None,
+        style_vec: torch.Tensor = None,
     ) -> dict:
-        enc_out = self.encode_phonemes(phoneme_ids, speaker_emb, phoneme_mask)
+        enc_out = self.encode_phonemes(phoneme_ids, speaker_emb, phoneme_mask,
+                                       style_vec=style_vec)
         pred_durations = self.duration_predictor(enc_out, phoneme_mask)
 
         use_durations = durations if durations is not None else pred_durations.round()
@@ -150,11 +159,13 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         phoneme_ids: torch.Tensor,
         speaker_emb: torch.Tensor,
         duration_scale: float = 1.0,
+        style_vec: torch.Tensor = None,
     ):
         self.eval()
         phoneme_mask = phoneme_ids != 0
 
-        enc_out = self.encode_phonemes(phoneme_ids, speaker_emb, phoneme_mask)
+        enc_out = self.encode_phonemes(phoneme_ids, speaker_emb, phoneme_mask,
+                                       style_vec=style_vec)
         pred_durations = self.duration_predictor(enc_out, phoneme_mask)
         pred_durations = (pred_durations * duration_scale).round().clamp(min=1)
 

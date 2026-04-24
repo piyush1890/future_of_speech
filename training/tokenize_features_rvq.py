@@ -47,19 +47,23 @@ def tokenize_all(args):
             if npz_path.stem == "norm_stats":
                 continue
 
+            out_path = output_dir / f"{npz_path.stem}.npy"
+            if args.skip_existing and out_path.exists():
+                continue
+
             data = np.load(npz_path)
             ema = data["ema"]
-            pitch = data["pitch"]
-            loudness = data["loudness"]
-
-            features = np.concatenate([ema, pitch[:, None], loudness[:, None]], axis=-1)
+            pitch = data["pitch"].squeeze()
+            loudness = data["loudness"].squeeze()
+            T = min(ema.shape[0], pitch.shape[0], loudness.shape[0])
+            features = np.concatenate([ema[:T], pitch[:T, None], loudness[:T, None]], axis=-1)
             features = (features - feat_mean) / feat_std
 
             x = torch.from_numpy(features.astype(np.float32)).unsqueeze(0).to(device)
             _, indices, _ = model.encode(x)
             tokens = indices.squeeze(0).cpu().numpy()  # (T, num_quantizers)
 
-            np.save(output_dir / f"{npz_path.stem}.npy", tokens)
+            np.save(out_path, tokens)
             count += 1
 
     print(f"Tokenized {count} utterances → {output_dir}")
@@ -72,6 +76,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default="checkpoints_rvq/rvq_best.pt")
     parser.add_argument("--output-dir", type=str, default="data/rvq_tokens_all")
     parser.add_argument("--device", type=str, default="mps")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Skip files that already have tokens in output dir.")
     args = parser.parse_args()
 
     tokenize_all(args)

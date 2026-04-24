@@ -8,15 +8,17 @@ conda activate arttts
 cd ~/projects/articulatory-tts
 
 # Configure which pipeline we're training
-SCRIPT="train_combined_360.sh"
-CHECKPOINT="checkpoints_rvq_merged/transformer_best.pt"
+SCRIPT="train_hier_v3_style_smooth.sh"
+LOG="train_hier_v3_style_smooth.log"
+CHECKPOINT="checkpoints_rvq_logpitch_hier_v3/transformer_best.pt"
 TARGET_EPOCH=50
 
-# Process patterns to detect running training
-PATTERNS=("$SCRIPT" "train_transformer_rvq.py" "train_vq_rvq.py" "tokenize_features_rvq.py" "build_mfa_dataset.py")
+# Process patterns to detect running training (any of these means "busy, don't restart")
+PATTERNS=("$SCRIPT" "train_transformer_rvq_hier.py" "train_transformer_rvq.py" "train_vq_rvq.py" "tokenize_features_rvq.py" "build_mfa_dataset.py")
 
 echo "Watchdog started at $(date)"
 echo "  Script:     $SCRIPT"
+echo "  Log:        $LOG"
 echo "  Checkpoint: $CHECKPOINT"
 echo "  Target:     epoch $TARGET_EPOCH"
 
@@ -30,7 +32,7 @@ is_running() {
 }
 
 get_best_epoch() {
-    python -c "
+    KMP_DUPLICATE_LIB_OK=TRUE python -c "
 import torch
 try:
     c = torch.load('$CHECKPOINT', map_location='cpu', weights_only=True)
@@ -57,12 +59,12 @@ while true; do
             echo "[$(date)] Training not running. Best epoch: $CURRENT_EPOCH. Restarting $SCRIPT..."
         fi
 
-        nohup ./$SCRIPT > train_output.log 2>&1 &
+        nohup ./$SCRIPT > $LOG 2>&1 &
         TRAIN_PID=$!
         echo "[$(date)] Restarted (PID: $TRAIN_PID)"
         sleep 30
     else
-        RUNNING_PID=$(pgrep -f "train_transformer_rvq.py" | head -1)
+        RUNNING_PID=$(pgrep -f "train_transformer_rvq_hier.py" | head -1)
         BEST_EPOCH=$(get_best_epoch)
         if [ -n "$RUNNING_PID" ]; then
             echo "[$(date)] Training running (PID: $RUNNING_PID, best epoch so far: $BEST_EPOCH)"

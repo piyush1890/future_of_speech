@@ -1,538 +1,252 @@
-# Articulatory Token TTS — Architecture
+# Articulatory Token TTS — Architecture & Training Documentation
 
-## The Big Picture
+## System Overview
+
+A text-to-speech system using **discrete articulatory tokens** as the intermediate representation. Instead of predicting acoustic features (mel spectrograms) or audio codec tokens, we predict the physical positions of speech articulators (tongue, jaw, lips) + pitch + loudness, then decode through a pretrained articulatory vocoder (SPARC).
 
 ```
-                         TRAINING PIPELINE
-                         ================
+Text → g2p → Phonemes → [Transformer] → RVQ Token IDs → [RVQ Decode] → 14-dim features → [SPARC Vocoder] → Waveform
+                              ↑                                              ↑
+                         spk_emb (64d)                                  spk_emb (64d)
+                         style_vec (256d)
+```
 
-   Audio (.flac)                          Text transcript
-        |                                      |
-        v                                      v
-  ┌───────────┐                          ┌──────────┐
-  │   SPARC    │                          │  g2p-en  │
-  │  Encoder   │                          │ (text to │
-  │(pretrained)│                          │ phonemes)│
-  └─────┬─────┘                          └────┬─────┘
-        |                                      |
-        v                                      v
-  14-dim features                      Phoneme sequence
-  (50 Hz per frame)                   ["HH","AH0","L","OW1"]
-        |                                      |
-        v                                      |
-  ┌───────────┐                                |
-  │    VQ      │                                |
-  │ Tokenizer  │                                |
-  │ (trained)  │                                |
-  └─────┬─────┘                                |
-        |                                      |
-        v                                      v
-  Token IDs ◄──── LOSS ────────── Transformer predicts
-  [42, 187, 53...]                these token IDs
-  (ground truth)                  from phonemes
+### Why Articulatory Tokens?
 
+1. **Language-independent**: mouth positions are the same physics regardless of language. A Hindi retroflex ट and English alveolar T are just different coordinates in the same 14-dim space.
+2. **Compact**: 14 continuous dims vs 80 mel dims. Quantizes well with small codebooks.
+3. **Physically grounded**: constraints like "pitch can't jump between adjacent frames" are real physics, not learned heuristics.
 
-                        INFERENCE PIPELINE
-                        ==================
+---
 
-   "Hello world"
-        |
-        v
-  ┌──────────┐
-  │  g2p-en  │
-  └────┬─────┘
-        |
-        v
-  ["HH","AH0","L","OW1"," ","W","ER1","L","D"]
-        |
-        v
-  ┌─────────────────────────────┐
-  │       TRANSFORMER           │
-  │  phonemes → token IDs       │
-  │  + speaker embedding        │
-  │  + duration prediction      │
-  └──────────┬──────────────────┘
-             |
-             v
-  Token IDs: [42, 187, 53, 53, 201, ...]
-             |
-             v
-  ┌───────────┐
-  │    VQ      │
-  │  Decoder   │
-  │(codebook   │
-  │  lookup)   │
-  └─────┬─────┘
-        |
-        v
-  14-dim continuous features (50 Hz)
-        |
-        v
-  ┌───────────┐
-  │   SPARC    │
-  │  Vocoder   │
-  │(pretrained)│
-  └─────┬─────┘
-        |
-        v
-   Audio waveform (16 kHz)
+## Components
+
+### 1. SPARC Vocoder (Pretrained, Frozen)
+
+**Source**: `speech-articulatory-coding` package
+**Function**: Encode audio → articulatory features; Decode features → audio
+**Features**: 14-dim per frame at 50 Hz
+
+| Channels | What | Range |
+|----------|------|-------|
+| 0-1 | Tongue tip X, Y | Fastest-moving articulator |
+| 2-3 | Tongue body X, Y | Moderate speed |
+| 4-5 | Tongue dorsum X, Y | Slow |
+| 6-7 | Jaw X, Y | Moderate |
+| 8-9 | Upper lip X, Y | Slow |
+| 10-11 | Lower lip X, Y | Moderate |
+| 12 | Pitch (log Hz) | Stored as log(Hz + 1) |
+| 13 | Loudness | Energy envelope |
+
+**Speaker embedding**: 64-dim vector per utterance, captures vocal tract shape/timbre.
+
+**Encode API**: `result = sparc.encode(wav)` → dict with keys: `ema`, `pitch`, `loudness`, `spk_emb`, `periodicity`, `pitch_stats`, `ft_len`
+
+**Decode API**: `wav = sparc.decode(ema, pitch_hz, loudness, spk_emb)`
+
+### 2. RVQ Tokenizer (`models/vq_tokenizer_rvq.py`)
+
+**Purpose**: Compress 14-dim continuous features → discrete tokens for transformer prediction.
+
+**Architecture** (~0.5M params):
+```
+Input (T, 14) → Linear(14, 128) → LayerNorm → GELU → Linear(128, 64)  [encoder]
+             → ResidualVQ(dim=64, 4 codebooks × 512 entries)            [quantizer]
+             → Linear(64, 128) → LayerNorm → GELU → Linear(128, 14)    [decoder]
+```
+
+**Output**: 4 integer token IDs per frame, each 0-511. Total vocabulary: 512 × 4 = 2048 effective tokens.
+
+**RVQ mechanics**: Level 0 captures coarse structure. Level k captures the residual error after levels 0..k-1. Summing all levels' codebook vectors reconstructs the original latent.
+
+**Training**: MSE reconstruction loss + commitment loss. Trained separately before transformer. Frozen during transformer training.
+
+**Checkpoint**: `checkpoints_rvq_logpitch/rvq_best.pt`
+
+**Codebook access** (for soft-decode smoothness loss):
+```python
+codebook_vectors = rvq.vq.layers[k]._codebook.embed  # (1, 512, 64)
+decoded_features = rvq.decoder(sum_of_codebook_vectors)  # (B, T, 14)
+```
+
+### 3. Hierarchical Transformer (`models/transformer_rvq_hier.py`)
+
+**Purpose**: Predict articulatory token sequences from phonemes + speaker + style.
+
+**Architecture** (~7.7M params):
+```
+Phoneme Encoder:
+  Embedding(73, 256) + PositionalEncoding
+  + speaker_proj(spk_emb: 64 → 256) broadcast
+  + style_proj(style_vec: 256 → 256) broadcast
+  4 × TransformerEncoderLayer(d=256, heads=4, ff=1024, dropout=0.1, norm_first=True)
+
+Duration Predictor (on encoder output):
+  Conv1d(256,256,k=3) → ReLU → LN → Conv1d(256,256,k=3) → ReLU → LN → Linear(256,1) → Softplus
+
+Length Regulator:
+  Expand each phoneme embedding by its predicted duration → (B, T_frames, 256)
+  Uses torch.repeat_interleave (optimized, no per-phoneme GPU sync)
+
+Frame Decoder:
+  PositionalEncoding
+  4 × TransformerEncoderLayer(d=256, heads=4, ff=1024)
+
+Hierarchical Output Heads:
+  4 × Linear(256, 512)  — one per RVQ level
+  Level k+1 conditions on level k's chosen token via cb_embeds[k]
+  Teacher forcing during training (ground-truth tokens fed to next level)
+  Greedy argmax during inference
+```
+
+**Key design decisions**:
+- Non-autoregressive (parallel frame generation) — articulatory features are smooth, no need for AR
+- Speaker conditioning via additive bias (not FiLM or cross-attention)
+- Style conditioning via additive bias from StyleEncoder output
+- cb_embeds zero-initialized → model starts equivalent to flat variant, enabling partial checkpoint loading
+
+### 4. Style Encoder (`models/style_encoder.py`)
+
+**Purpose**: Extract a style vector from a reference utterance's SPARC features. Enables Approach B style conditioning — "speak this text like THAT reference audio."
+
+**Architecture** (~0.42M params):
+```
+Input: (B, T, 14) SPARC features
+  → 4 × Conv1d(stride=2) + BatchNorm + ReLU     [compress time by 16x]
+  → Bidirectional GRU(hidden=128)                 [aggregate to fixed length]
+  → Linear(256, 256)                               [project to style_dim]
+Output: (B, 256) style vector
+```
+
+**Training**: jointly with the transformer. Each training utterance's own features are fed to the style encoder — it learns to extract whatever prosodic/stylistic information helps the transformer reconstruct the output.
+
+**Inference**: encode a reference audio clip through SPARC → feed features to StyleEncoder → get style_vec → condition transformer.
+
+---
+
+## Training Data (v3): ~112K utterances
+
+| Source | Files | Hours | Content | Phoneme Source |
+|--------|-------|-------|---------|----------------|
+| LibriSpeech train-clean-100 | ~28K | ~100h | Audiobook reading | MFA alignment |
+| LibriSpeech train-clean-360 (partial) | ~54K | ~180h | Audiobook reading | MFA alignment |
+| ESD (Emotional Speech Database) | ~17.5K | ~29h | 5 emotions × 10 speakers | MFA alignment |
+| Expresso (Meta/FAIR) | ~11.6K | ~40h | 7 styles × 4 speakers | g2p + proportional |
+| **Total** | **~112K** | **~349h** | | |
+
+### Data Pipeline
+
+```
+Raw audio (.flac/.wav)
+  → SPARC encode → {ema, pitch, loudness, spk_emb}.npz
+  → Log-pitch transform → features_merged_logpitch_v2/*.npz
+  → RVQ tokenize → rvq_tokens_logpitch_v2/*.npy
+  → MFA/g2p alignment → processed_merged_v3/{phonemes,alignments}_mfa.json
+```
+
+### Feature File Format (.npz)
+
+```
+ema:      (T, 12) float32  — articulatory positions
+pitch:    (T,)    float32  — log(Hz + 1)
+loudness: (T,)    float32  — energy
+spk_emb:  (64,)   float32  — speaker embedding
+```
+
+### Normalization
+
+`norm_stats.npz` contains per-channel `mean` (14,) and `std` (14,) over the full training set. Training: `feat_norm = (feat - mean) / std`. Inference: `feat = feat_norm * std + mean`.
+
+---
+
+## Loss Function
+
+### 1. Cross-Entropy (token prediction)
+
+```python
+total_ce = sum(level_weights[k] * masked_CE(logits[:,:,k], target[:,:,k]) for k in range(4))
+```
+
+Uniform level weights [0.25 × 4]. Treats each frame independently.
+
+### 2. Duration Loss
+
+```python
+dur_loss = MSE(log(pred_dur + 1), log(gt_dur + 1))
+```
+
+### 3. Temporal Smoothness Loss (NEW)
+
+Differentiable soft-decode through frozen RVQ codebook → per-channel weighted frame-to-frame penalty:
+
+```python
+soft_features = soft_decode(softmax(logits/T), codebook) → rvq.decoder → (B, T, 14)
+diff = soft_features[:, 1:] - soft_features[:, :-1]
+smooth_loss = (diff² × channel_weights).mean()
+```
+
+**Channel weights** (from σ² of inference smoothing):
+
+| Channel | Weight | Physics |
+|---------|--------|---------|
+| Tongue tip (0-1) | 0.12 | Fast moves real |
+| Other EMA (2-11) | 0.33 | Moderate |
+| **Pitch (12)** | **3.0** | Vocal cords have inertia |
+| Loudness (13) | 1.33 | Lungs can't change instantly |
+
+**Total**: `total_loss = ce_loss + 0.1 × dur_loss + 6.0 × smooth_loss`
+
+Smooth loss contributes ~15% of gradient. First time pitch gets dominant training signal (52% of smooth gradient vs ~2-5% of CE gradient).
+
+---
+
+## Inference Post-Processing
+
+Channel-aware Gaussian smoothing matching the training loss physics:
+
+```python
+# Tongue tip: very light (real fast movements exist)
+features[:, 0:2]  = gaussian_filter1d(sigma=0.3)
+# Other EMA: light
+features[:, 2:12] = gaussian_filter1d(sigma=0.5)
+# Pitch: smooth in LOG space (before Hz conversion)
+features[:, 12]   = gaussian_filter1d(sigma=1.5)
+pitch_hz = exp(features[:, 12]) - 1.0
+# Loudness: smooth
+features[:, 13]   = gaussian_filter1d(sigma=1.0)
 ```
 
 ---
 
-## Component 1: SPARC Encoder (Pretrained, not trained by us)
+## Performance
 
-```
-  Audio waveform (16 kHz)
-        |
-        v
-  ┌──────────────────────────────────────────┐
-  │              SPARC ENCODER               │
-  │                                          │
-  │  ┌────────────────────┐                  │
-  │  │  WavLM Large       │ (frozen)         │
-  │  │  (speech SSL model) │                  │
-  │  └─────────┬──────────┘                  │
-  │            |                              │
-  │     ┌──────┴──────────┐                  │
-  │     |                  |                  │
-  │     v                  v                  │
-  │  ┌────────┐    ┌──────────────┐          │
-  │  │Linear  │    │   Speaker    │          │
-  │  │Regress.│    │   Encoder    │          │
-  │  └───┬────┘    │(periodicity- │          │
-  │      |         │ weighted     │          │
-  │      v         │ pooling +    │          │
-  │   12 EMA       │ FFN)         │          │
-  │   features     └──────┬───────┘          │
-  │   (50 Hz)             |                  │
-  │      |                v                  │
-  │      |          64-dim speaker           │
-  │      |          embedding                │
-  │      |          (1 per utterance)        │
-  │      |                                   │
-  │  Also extracts:                          │
-  │  - Pitch (CREPE, 50 Hz)                  │
-  │  - Loudness (50 Hz)                      │
-  └──────────────────────────────────────────┘
+### Training (M4 Pro, 24GB, MPS)
 
-  Output per frame (50 Hz = 50 frames per second):
+| Config | Batch | it/s | Samples/s |
+|--------|-------|------|-----------|
+| Old (B=8, old LR) | 8 | 2.3 | 18 |
+| **New (B=24, optimized LR)** | **24** | **~4.8** | **~114** |
 
-  ┌──────────────────────────────────────────────────┐
-  │  12 EMA channels          │ Pitch │ Loudness     │
-  │                            │       │              │
-  │  TD_x  TD_y   (tongue back)│       │              │
-  │  TB_x  TB_y   (tongue mid) │  Hz   │  amplitude   │
-  │  TT_x  TT_y   (tongue tip)│       │              │
-  │  UL_x  UL_y   (upper lip) │       │              │
-  │  LI_x  LI_y   (jaw)       │       │              │
-  │  LL_x  LL_y   (lower lip) │       │              │
-  └──────────────────────────────────────────────────┘
-       14 dimensions total per frame
-```
-
-**What EMA means physically:**
-
-```
-  Side view of mouth:
-
-        Soft palate
-            \
-    TD ●─────\────── Tongue Dorsum (back)
-              \
-    TB ●───────── Tongue Blade (middle)
-              /
-    TT ●─────/──── Tongue Tip
-            /
-    UL ●──/─── Upper Lip
-           |
-    LL ●───── Lower Lip
-           |
-    LI ●───── Lower Incisor (jaw)
-
-  Each ● is tracked in X (front-back) and Y (up-down)
-  = 6 articulators × 2 coordinates = 12 dimensions
-```
+**Key optimization**: LengthRegulator `torch.repeat_interleave` replacing per-phoneme `.item()` GPU sync. ~6x throughput improvement.
 
 ---
 
-## Component 2: VQ Tokenizer (Trained by us)
+## Bilingual (English + Hindi)
 
-```
-  Continuous features ──► Discrete tokens ──► Reconstructed features
-     (14-dim, float)         (integer IDs)       (14-dim, float)
+SPARC features are language-independent. Same RVQ codebook serves both (retrain on mixed data for full coverage). Separate transformer per language, initialized from English checkpoint.
 
-  Detailed architecture:
+**Hindi roundtrip verified**: SPARC roundtrip perfect. RVQ roundtrip: pronunciation correct, minor shakiness from missing retroflex codebook entries.
 
-  Input: (batch, time, 14)
-         normalized features
-              |
-              v
-  ┌─────────────────────────┐
-  │      PRE-ENCODER        │
-  │                         │
-  │  Linear(14 → 128)       │
-  │  LayerNorm              │
-  │  GELU activation        │
-  │  Linear(128 → 64)       │
-  └───────────┬─────────────┘
-              |
-              v
-        (batch, time, 64)
-              |
-              v
-  ┌─────────────────────────┐
-  │    VECTOR QUANTIZER     │
-  │                         │
-  │  Codebook: 512 vectors  │
-  │  Each vector: 64-dim    │
-  │                         │
-  │  For each frame:        │
-  │  1. Find nearest        │
-  │     codebook entry      │
-  │  2. Replace with that   │
-  │     entry               │
-  │  3. Record the index    │
-  │                         │
-  │  ┌───┬───┬───┬───┐     │
-  │  │ 0 │ 1 │ 2 │...│512  │ ◄── codebook
-  │  └───┴───┴───┴───┘     │
-  │    ▲                    │
-  │    │ nearest neighbor   │
-  │    │                    │
-  └───────────┬─────────────┘
-              |
-              ├──► Token index (e.g., 42)
-              |
-              v
-        (batch, time, 64)
-        quantized vectors
-              |
-              v
-  ┌─────────────────────────┐
-  │      POST-DECODER       │
-  │                         │
-  │  Linear(64 → 128)       │
-  │  LayerNorm              │
-  │  GELU activation        │
-  │  Linear(128 → 14)       │
-  └───────────┬─────────────┘
-              |
-              v
-  Output: (batch, time, 14)
-          reconstructed features
-
-  Loss = MSE(input, output) + commitment_loss
-         (pitch & loudness get 2× weight)
-
-
-  WHAT THE CODEBOOK LEARNS:
-
-  Token 42:  tongue high-front, lips rounded    → "oo" position
-  Token 187: tongue low, jaw open, lips wide    → "aa" position
-  Token 53:  lips together, jaw closed          → "m"/"b" position
-  Token 301: tongue tip up, touching ridge      → "t"/"d" position
-  ...
-  512 discrete mouth positions that can represent all of speech
-```
+**Hindi data**: 3.2K files (Hindi SER), 40 hours planned (IndicVoices).
 
 ---
 
-## Component 3: TTS Transformer (Trained by us)
+## Key Learnings
 
-```
-  ┌──────────────────────────────────────────────────────────────┐
-  │                    TTS TRANSFORMER                           │
-  │                                                              │
-  │                                                              │
-  │   Phonemes: [<bos>, HH, AH0, L, OW1, <sil>, W, ..., <eos>] │
-  │       |                                                      │
-  │       v                                                      │
-  │   ┌──────────────┐                                           │
-  │   │  Embedding    │  (73 phonemes → 256-dim vectors)         │
-  │   └──────┬───────┘                                           │
-  │          |                                                    │
-  │          v                                                    │
-  │   ┌──────────────┐                                           │
-  │   │  + Positional │  (sinusoidal encoding)                   │
-  │   │  Encoding     │                                           │
-  │   └──────┬───────┘                                           │
-  │          |                                                    │
-  │          |    ┌──────────────────┐                            │
-  │          |    │ Speaker Embedding │                           │
-  │          |    │ Linear(64 → 256)  │                           │
-  │          |    └────────┬─────────┘                            │
-  │          |             |                                      │
-  │          v             v                                      │
-  │   ┌──────────────────────┐                                   │
-  │   │    ADD (phonemes +   │                                   │
-  │   │    speaker identity) │                                   │
-  │   └──────────┬───────────┘                                   │
-  │              |                                                │
-  │              v                                                │
-  │   ┌────────────────────────────────────────┐                 │
-  │   │         ENCODER (2 layers)             │                 │
-  │   │                                         │                 │
-  │   │  ┌───────────────────────────────────┐ │                 │
-  │   │  │ Self-Attention (4 heads)          │ │                 │
-  │   │  │ "How does each phoneme relate     │ │                 │
-  │   │  │  to its neighbors?"               │ │                 │
-  │   │  └───────────────┬───────────────────┘ │                 │
-  │   │                  |                      │                 │
-  │   │  ┌───────────────v───────────────────┐ │                 │
-  │   │  │ Feed-Forward (256 → 512 → 256)    │ │                 │
-  │   │  └───────────────┬───────────────────┘ │                 │
-  │   │                  |                      │                 │
-  │   │            (repeat × 2 layers)          │                 │
-  │   └──────────────────┬─────────────────────┘                 │
-  │                      |                                        │
-  │          ┌───────────┴──────────────┐                        │
-  │          |                          |                         │
-  │          v                          v                         │
-  │   ┌──────────────┐          ┌─────────────────┐             │
-  │   │   DURATION    │          │  Encoded         │             │
-  │   │   PREDICTOR   │          │  phonemes        │             │
-  │   │               │          │  (N, 256)        │             │
-  │   │  Conv1d → ReLU │          │                  │             │
-  │   │  Conv1d → ReLU │          │                  │             │
-  │   │  Linear → SP  │          │                  │             │
-  │   │               │          │                  │             │
-  │   │  Output: how  │          │                  │             │
-  │   │  many frames  │          │                  │             │
-  │   │  each phoneme │          │                  │             │
-  │   │  lasts        │          │                  │             │
-  │   └──────┬───────┘          └────────┬────────┘             │
-  │          |                           |                        │
-  │          |     e.g., [3, 5, 4, 8, 6, 3, ...]                │
-  │          |                           |                        │
-  │          v                           v                        │
-  │   ┌──────────────────────────────────────────┐               │
-  │   │          LENGTH REGULATOR                 │               │
-  │   │                                           │               │
-  │   │  Repeat each phoneme embedding by its     │               │
-  │   │  predicted duration:                      │               │
-  │   │                                           │               │
-  │   │  Phonemes: [HH    ] [AH0        ] [L  ]  │               │
-  │   │  Duration:  3 frames  5 frames     4 fr   │               │
-  │   │  Expanded: [HH,HH,HH,AH,AH,AH,AH,AH,    │               │
-  │   │            L,L,L,L, ...]                  │               │
-  │   │                                           │               │
-  │   │  Input:  (N phonemes, 256)                │               │
-  │   │  Output: (T frames, 256)                  │               │
-  │   └──────────────────┬────────────────────────┘               │
-  │                      |                                        │
-  │                      v                                        │
-  │   ┌────────────────────────────────────────┐                 │
-  │   │         DECODER (2 layers)             │                 │
-  │   │                                         │                 │
-  │   │  Same structure as encoder:             │                 │
-  │   │  Self-Attention + Feed-Forward          │                 │
-  │   │  × 2 layers                             │                 │
-  │   │                                         │                 │
-  │   │  "What articulatory token should each   │                 │
-  │   │   frame produce?"                       │                 │
-  │   └──────────────────┬─────────────────────┘                 │
-  │                      |                                        │
-  │                      v                                        │
-  │   ┌──────────────────────────────────┐                       │
-  │   │  OUTPUT PROJECTION               │                       │
-  │   │  Linear(256 → 512)              │                       │
-  │   │                                  │                       │
-  │   │  Produces logits over 512        │                       │
-  │   │  codebook entries for each frame │                       │
-  │   └──────────────────┬───────────────┘                       │
-  │                      |                                        │
-  │                      v                                        │
-  │   Token IDs: [42, 42, 42, 187, 187, 187, 187, 187,          │
-  │               53, 53, 53, 53, ...]                           │
-  │              one per frame at 50 Hz                           │
-  └──────────────────────────────────────────────────────────────┘
-
-
-  TRAINING: cross-entropy loss between predicted and ground-truth tokens
-  INFERENCE: argmax over logits → token IDs
-```
-
----
-
-## Component 4: SPARC Vocoder (Pretrained, not trained by us)
-
-```
-  Token IDs → VQ Codebook Lookup → 14-dim features → Vocoder → Audio
-
-  ┌──────────────────────────────────────────────────────────────┐
-  │                    SPARC VOCODER                             │
-  │                    (HiFi-GAN + FiLM)                        │
-  │                                                              │
-  │  Input: 14 channels at 50 Hz                                │
-  │         + 64-dim speaker embedding                          │
-  │                                                              │
-  │  ┌────────────────────────────────────────────┐             │
-  │  │  Upsampling stages: [8, 8, 2, 2] = 256×   │             │
-  │  │  50 Hz × 256 = 12,800 Hz... wait,          │             │
-  │  │  actually [8, 5, 4, 2] = 320×              │             │
-  │  │  50 Hz × 320 = 16,000 Hz ✓                │             │
-  │  │                                             │             │
-  │  │  Stage 1: 50 Hz → 400 Hz   (×8)           │             │
-  │  │  Stage 2: 400 Hz → 2000 Hz  (×5)          │             │
-  │  │  Stage 3: 2000 Hz → 8000 Hz (×4)          │             │
-  │  │  Stage 4: 8000 Hz → 16000 Hz (×2)         │             │
-  │  │                                             │             │
-  │  │  Each stage:                                │             │
-  │  │  TransposedConv (upsample)                  │             │
-  │  │    → Multi-Receptive-Field block            │             │
-  │  │      (3 parallel residual blocks            │             │
-  │  │       with dilations [1, 3, 5])             │             │
-  │  │    → FiLM conditioning from speaker_emb     │             │
-  │  │      (gain & bias per channel)              │             │
-  │  └────────────────────────────────────────────┘             │
-  │                                                              │
-  │  Speaker FiLM conditioning:                                 │
-  │  ┌─────────────────────────────────────────┐               │
-  │  │  speaker_emb (64-dim)                    │               │
-  │  │       |                                  │               │
-  │  │       v                                  │               │
-  │  │  Linear → gain (γ) and bias (β)         │               │
-  │  │       |                                  │               │
-  │  │       v                                  │               │
-  │  │  output = γ * features + β              │               │
-  │  │                                          │               │
-  │  │  This makes the SAME articulatory tokens │               │
-  │  │  sound like DIFFERENT speakers            │               │
-  │  └─────────────────────────────────────────┘               │
-  │                                                              │
-  │  Output: waveform at 16,000 Hz                              │
-  └──────────────────────────────────────────────────────────────┘
-```
-
----
-
-## End-to-End Data Flow Example
-
-```
-  Input: "Hello"
-
-  Step 1 — Text to Phonemes (g2p-en):
-  ┌─────────────────────────────────────────┐
-  │ "Hello" → ["HH", "AH0", "L", "OW1"]   │
-  └─────────────────────────────────────────┘
-
-  Step 2 — Phoneme Encoding (Transformer Encoder):
-  ┌─────────────────────────────────────────────────┐
-  │ [HH, AH0, L, OW1] → 4 × 256-dim vectors       │
-  │ + speaker embedding added                        │
-  │ Self-attention learns: "L before OW1 = dark L"  │
-  └─────────────────────────────────────────────────┘
-
-  Step 3 — Duration Prediction:
-  ┌─────────────────────────────────────────────────┐
-  │ HH → 3 frames (60ms)                           │
-  │ AH0 → 5 frames (100ms)                         │
-  │ L → 4 frames (80ms)                            │
-  │ OW1 → 8 frames (160ms)                         │
-  │ Total: 20 frames = 400ms                        │
-  └─────────────────────────────────────────────────┘
-
-  Step 4 — Length Regulation (expand):
-  ┌─────────────────────────────────────────────────┐
-  │ Frame:  1  2  3  4  5  6  7  8  9 10 11 ... 20 │
-  │ Phone: HH HH HH AH AH AH AH AH  L  L  L  OW  │
-  └─────────────────────────────────────────────────┘
-
-  Step 5 — Decoder → Token Prediction:
-  ┌─────────────────────────────────────────────────┐
-  │ Frame 1 → token 301 (tongue tip up, air burst)  │
-  │ Frame 2 → token 301                             │
-  │ Frame 3 → token 288 (transitioning...)          │
-  │ Frame 4 → token 187 (jaw open, tongue low)      │
-  │ Frame 5 → token 187                             │
-  │ ...                                              │
-  │ Frame 20 → token 42 (lips rounded, tongue back) │
-  └─────────────────────────────────────────────────┘
-
-  Step 6 — VQ Decode (codebook lookup → continuous):
-  ┌─────────────────────────────────────────────────┐
-  │ token 301 → [0.2, -0.5, 0.8, ...]  (14-dim)   │
-  │ token 187 → [-0.3, 1.1, -0.2, ...]             │
-  │ token 42  → [0.7, 0.4, -0.6, ...]              │
-  │                                                  │
-  │ Denormalize: features * std + mean               │
-  └─────────────────────────────────────────────────┘
-
-  Step 7 — SPARC Vocoder:
-  ┌─────────────────────────────────────────────────┐
-  │ 20 frames of articulatory features              │
-  │ + speaker embedding (voice identity)            │
-  │           ↓                                      │
-  │ HiFi-GAN upsamples 320×                         │
-  │ 20 × 320 = 6,400 audio samples                  │
-  │           ↓                                      │
-  │ 400ms of audio at 16kHz: "Hello"                │
-  └─────────────────────────────────────────────────┘
-```
-
----
-
-## What Makes This Novel
-
-```
-  TRADITIONAL TTS (VALL-E, F5-TTS):
-  ┌────────────────────────────────────────────┐
-  │ Text → Acoustic Tokens → Audio             │
-  │         (what it SOUNDS like)              │
-  │         ~75 tokens/sec                      │
-  │         1024+ codebook                      │
-  │         speaker-dependent                   │
-  └────────────────────────────────────────────┘
-
-  OUR APPROACH:
-  ┌────────────────────────────────────────────┐
-  │ Text → Articulatory Tokens → Audio         │
-  │         (what the MOUTH does)              │
-  │         50 tokens/sec                       │
-  │         512 codebook                        │
-  │         speaker-INDEPENDENT                 │
-  │         (speaker added at vocoder stage)    │
-  └────────────────────────────────────────────┘
-
-  Key advantages (if it works):
-  • Shorter sequences → cheaper transformer attention
-  • Smaller codebook → easier to predict
-  • Physically meaningful → better cross-lingual transfer
-  • Speaker separated → voice cloning is just swapping an embedding
-```
-
----
-
-## Training Losses Explained
-
-```
-  VQ TOKENIZER LOSS:
-  ┌────────────────────────────────────────────┐
-  │ MSE(reconstructed, original)               │
-  │   "How well can we reconstruct features    │
-  │    from discrete tokens?"                  │
-  │                                            │
-  │ + Commitment loss                          │
-  │   "Stay close to your assigned codebook    │
-  │    entry (don't oscillate)"                │
-  │                                            │
-  │ Our result: val_loss = 0.2075              │
-  │ Perplexity: 164 of 512 codes used          │
-  └────────────────────────────────────────────┘
-
-  TRANSFORMER LOSS:
-  ┌────────────────────────────────────────────┐
-  │ Cross-Entropy(predicted_logits, true_token)│
-  │   "Did you predict the right codebook      │
-  │    entry for each frame?"                  │
-  │                                            │
-  │ + Duration MSE(predicted_dur, true_dur)    │
-  │   "Did you predict how long each           │
-  │    phoneme lasts?"                         │
-  │                                            │
-  │ Random baseline: CE = ln(512) ≈ 6.24      │
-  │ Our best so far: val CE ≈ 5.18            │
-  │ Goal: val CE < 4.0                         │
-  └────────────────────────────────────────────┘
-```
+1. **Pitch smoothness is physics**: frame-to-frame jumps physically impossible. Must be in training loss, not just post-processing.
+2. **CE undertreats pitch**: 1 dim out of 14 = ~2-5% of gradient. Smoothness loss with weight 3.0 fixes this.
+3. **Style ≠ emotion ≠ speaker**: three separate conditioning dimensions (spk_emb, style_vec, future emotion tokens).
+4. **LengthRegulator `.item()` sync was 2x bottleneck**: `repeat_interleave` eliminates it.
+5. **LibriSpeech has ~26% emotional content**: HuBERT tagging shows it's not all neutral.
+6. **Inference σ maps to training loss via σ²**: same physics expressed as either post-processing or gradient signal.
+7. **Post-hoc deltas don't work**: adding emotion after generation garbles speech. Conditioning before generation (style encoder) is the correct architecture.

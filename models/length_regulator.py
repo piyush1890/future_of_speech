@@ -27,25 +27,20 @@ class LengthRegulator(nn.Module):
         B, N, D = x.shape
         durations_int = durations.long()
 
-        # Compute max output length
+        # Compute max output length (single CPU sync)
         output_lengths = durations_int.sum(dim=1)  # (B,)
-        T = target_len if target_len is not None else output_lengths.max().item()
+        T = target_len if target_len is not None else int(output_lengths.max().item())
 
         expanded = torch.zeros(B, T, D, device=x.device, dtype=x.dtype)
         mask = torch.zeros(B, T, device=x.device, dtype=torch.bool)
 
+        # Use repeat_interleave per batch (one sync per batch item, not per phoneme)
+        arange_N = torch.arange(N, device=x.device)
         for b in range(B):
-            pos = 0
-            for n in range(N):
-                dur = durations_int[b, n].item()
-                if dur <= 0:
-                    continue
-                end = min(pos + dur, T)
-                if pos < T:
-                    expanded[b, pos:end] = x[b, n]
-                    mask[b, pos:end] = True
-                pos = end
-                if pos >= T:
-                    break
+            idx = torch.repeat_interleave(arange_N, durations_int[b])
+            T_b = min(idx.shape[0], T)
+            if T_b > 0:
+                expanded[b, :T_b] = x[b, idx[:T_b]]
+                mask[b, :T_b] = True
 
         return expanded, mask
