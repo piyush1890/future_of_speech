@@ -9,6 +9,15 @@ for deeper codebooks. Feeding earlier tokens in sharpens the target distribution
 At init, `cb_embeds` are zeroed, making this model numerically identical to the
 flat variant. Training grows these embeddings as they become useful — enabling
 partial-load from a flat checkpoint without performance regression.
+
+Style conditioning supports two modes (caller picks one):
+  - `style_vec`: shape (B, d_model). Pooled per-utterance. Broadcast over phoneme
+    positions. v3/v4 path; kept for v4 checkpoint inference. Diagnosed in v4 to
+    leak utterance length into duration predictor.
+  - `style_emb`: shape (B, N, d_model). Per-phoneme. Added directly without
+    broadcasting. v5 path. Caller is responsible for the codebook lookup.
+
+Pass exactly one (or neither, for no style) per call.
 """
 import math
 from typing import Optional
@@ -35,11 +44,29 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         dropout: float = 0.1,
         speaker_emb_dim: int = 64,
         style_dim: int = None,
+        tied_output: bool = False,
+        codebook_latent_dim: int = 64,
     ):
+        """
+        tied_output=False (v3/v4/v5 default): output_projs[k] = Linear(d_model, codebook_size).
+                                              Independent learned projection per token id.
+                                              Probability is feature-aware only via training-data
+                                              correlations.
+        tied_output=True  (v6): output_projs[k] = Linear(d_model, codebook_latent_dim).
+                                Logits computed as h_proj @ codebook[k].T — direct similarity
+                                to each codebook entry. Probability is structurally feature-aware:
+                                tokens whose codebook entries are close to h_proj get high probability.
+                                The frozen codebooks are stored as a buffer; populate via
+                                init_tied_codebooks(rvq_model) before training/inference.
+        codebook_latent_dim:    dimension of each codebook entry in the frozen RVQ. Defaults to 64
+                                matching our standard RVQ. Only used when tied_output=True.
+        """
         super().__init__()
         self.d_model = d_model
         self.codebook_size = codebook_size
         self.num_quantizers = num_quantizers
+        self.tied_output = tied_output
+        self.codebook_latent_dim = codebook_latent_dim
 
         self.phoneme_embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.encoder_pe = PositionalEncoding(d_model, dropout=dropout)
@@ -64,9 +91,24 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         )
         self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=num_decoder_layers)
 
+        # Output projection: independent Linear per level (untied) or projection
+        # into codebook latent space (tied — logit = h_proj · codebook_entry).
+        out_dim = codebook_latent_dim if tied_output else codebook_size
         self.output_projs = nn.ModuleList([
-            nn.Linear(d_model, codebook_size) for _ in range(num_quantizers)
+            nn.Linear(d_model, out_dim) for _ in range(num_quantizers)
         ])
+
+        # When tied: register a buffer for the frozen codebook entries per level.
+        # Populate via init_tied_codebooks(rvq_model) BEFORE training/inference.
+        # Stays zeros until populated; if the buffer is all-zero at forward, raises.
+        if tied_output:
+            self.register_buffer(
+                "frozen_codebooks",
+                torch.zeros(num_quantizers, codebook_size, codebook_latent_dim),
+            )
+            # Optional: a per-level learnable temperature so the model can scale
+            # similarity scores into a useful logit distribution.
+            self.tied_log_temps = nn.Parameter(torch.zeros(num_quantizers))
 
         # cb_embeds[k] embeds the chosen token at level k to condition level k+1.
         # Only K-1 needed (nothing consumes the last level's token).
@@ -77,14 +119,35 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         for emb in self.cb_embeds:
             nn.init.zeros_(emb.weight)
 
+    def init_tied_codebooks(self, rvq_model):
+        """Copy frozen RVQ codebook entries into the model's buffer.
+        Call once after constructing the model (and after loading the RVQ),
+        before training. Required when tied_output=True."""
+        if not self.tied_output:
+            return
+        for k in range(self.num_quantizers):
+            embed = rvq_model.vq.layers[k]._codebook.embed
+            if embed.dim() == 3:   # (1, C, D) → (C, D)
+                embed = embed.squeeze(0)
+            assert embed.shape == (self.codebook_size, self.codebook_latent_dim), \
+                f"Codebook level {k} shape {embed.shape} != ({self.codebook_size}, {self.codebook_latent_dim})"
+            self.frozen_codebooks[k].copy_(embed.detach())
+        print(f"  Tied output: copied {self.num_quantizers} codebooks into model buffer")
+
     def encode_phonemes(self, phoneme_ids, speaker_emb, phoneme_mask=None,
-                        style_vec=None):
+                        style_vec=None, style_emb=None):
+        if style_vec is not None and style_emb is not None:
+            raise ValueError("Pass at most one of style_vec (v4 broadcast) or "
+                             "style_emb (v5 per-phoneme), not both.")
         x = self.phoneme_embedding(phoneme_ids)
         x = self.encoder_pe(x)
         spk = self.speaker_proj(speaker_emb).unsqueeze(1)
         x = x + spk
         if style_vec is not None:
-            x = x + self.style_proj(style_vec).unsqueeze(1)
+            x = x + self.style_proj(style_vec).unsqueeze(1)   # (B, 1, D) broadcast
+        elif style_emb is not None:
+            # Per-phoneme style; no projection (caller's codebook output is already d_model)
+            x = x + style_emb                                  # (B, N, D) direct add
         padding_mask = ~phoneme_mask if phoneme_mask is not None else None
         x = self.encoder(x, src_key_padding_mask=padding_mask)
         return x
@@ -116,7 +179,15 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         logits_per_level = []
 
         for k in range(K):
-            logits_k = self.output_projs[k](context)  # (B, T, C)
+            if self.tied_output:
+                # h_proj: (B, T, latent_dim); codebook[k]: (codebook_size, latent_dim)
+                h_proj = self.output_projs[k](context)
+                # Logits = similarity between projected hidden state and each codebook entry
+                logits_k = h_proj @ self.frozen_codebooks[k].T   # (B, T, codebook_size)
+                # Learnable per-level temperature on the similarity scores
+                logits_k = logits_k * torch.exp(self.tied_log_temps[k])
+            else:
+                logits_k = self.output_projs[k](context)  # (B, T, C)
             logits_per_level.append(logits_k)
 
             if k < K - 1:
@@ -137,9 +208,10 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         phoneme_mask: torch.Tensor = None,
         target_tokens: torch.Tensor = None,
         style_vec: torch.Tensor = None,
+        style_emb: torch.Tensor = None,
     ) -> dict:
         enc_out = self.encode_phonemes(phoneme_ids, speaker_emb, phoneme_mask,
-                                       style_vec=style_vec)
+                                       style_vec=style_vec, style_emb=style_emb)
         pred_durations = self.duration_predictor(enc_out, phoneme_mask)
 
         use_durations = durations if durations is not None else pred_durations.round()
@@ -160,12 +232,13 @@ class ArticulatoryTTSModelRVQHier(nn.Module):
         speaker_emb: torch.Tensor,
         duration_scale: float = 1.0,
         style_vec: torch.Tensor = None,
+        style_emb: torch.Tensor = None,
     ):
         self.eval()
         phoneme_mask = phoneme_ids != 0
 
         enc_out = self.encode_phonemes(phoneme_ids, speaker_emb, phoneme_mask,
-                                       style_vec=style_vec)
+                                       style_vec=style_vec, style_emb=style_emb)
         pred_durations = self.duration_predictor(enc_out, phoneme_mask)
         pred_durations = (pred_durations * duration_scale).round().clamp(min=1)
 

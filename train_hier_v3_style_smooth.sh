@@ -18,10 +18,10 @@ python -u training/train_transformer_rvq_hier.py \
     --features-dir data/features_merged_logpitch_v2 \
     --phonemes-path data/processed_merged_v3/phonemes_mfa.json \
     --alignments-path data/processed_merged_v3/alignments_mfa.json \
-    --vq-tokens-dir data/rvq_tokens_logpitch_v2 \
+    --vq-tokens-dir data/rvq_tokens_logpitch_v3 \
     --vocab-path data/processed_all/vocab_mfa.json \
-    --checkpoint-dir checkpoints_rvq_logpitch_hier_v3 \
-    --rvq-checkpoint checkpoints_rvq_logpitch/rvq_best.pt \
+    --checkpoint-dir checkpoints_rvq_logpitch_hier_v4 \
+    --rvq-checkpoint checkpoints_rvq_logpitch_v2/rvq_best.pt \
     --resume \
     --device mps \
     --epochs 50 \

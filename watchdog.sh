@@ -8,13 +8,13 @@ conda activate arttts
 cd ~/projects/articulatory-tts
 
 # Configure which pipeline we're training
-SCRIPT="train_hier_v3_style_smooth.sh"
-LOG="train_hier_v3_style_smooth.log"
-CHECKPOINT="checkpoints_rvq_logpitch_hier_v3/transformer_best.pt"
+SCRIPT="train_v6_stage1.sh"
+LOG="train_v6_stage1.log"
+CHECKPOINT="checkpoints_v6_stage1/transformer_best.pt"
 TARGET_EPOCH=50
 
 # Process patterns to detect running training (any of these means "busy, don't restart")
-PATTERNS=("$SCRIPT" "train_transformer_rvq_hier.py" "train_transformer_rvq.py" "train_vq_rvq.py" "tokenize_features_rvq.py" "build_mfa_dataset.py")
+PATTERNS=("$SCRIPT" "train_v5_stage1.py" "train_v5_stage1.sh" "train_transformer_rvq_hier.py" "train_transformer_rvq.py" "train_vq_rvq.py" "tokenize_features_rvq.py" "build_mfa_dataset.py")
 
 echo "Watchdog started at $(date)"
 echo "  Script:     $SCRIPT"
@@ -64,7 +64,7 @@ while true; do
         echo "[$(date)] Restarted (PID: $TRAIN_PID)"
         sleep 30
     else
-        RUNNING_PID=$(pgrep -f "train_transformer_rvq_hier.py" | head -1)
+        RUNNING_PID=$(pgrep -f "train_v5_stage1.py" | head -1)   # script name unchanged; v6 just sets flags
         BEST_EPOCH=$(get_best_epoch)
         if [ -n "$RUNNING_PID" ]; then
             echo "[$(date)] Training running (PID: $RUNNING_PID, best epoch so far: $BEST_EPOCH)"

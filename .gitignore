@@ -35,3 +35,12 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Claude Code local state
+.claude/
+
+# Backup tarballs (too big for git, kept locally)
+backups/
+
+# Logs dir (in addition to *.log)
+logs/

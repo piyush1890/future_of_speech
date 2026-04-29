@@ -1,6 +1,11 @@
 """
 Dataset for TTS transformer with multi-codebook RVQ tokens.
 Token shape per utterance: (T, num_quantizers)
+
+v5 addition: optional `metadata_path` surfaces (emotion_id, style_id, intensity)
+per utterance for the planner. Stage 1 loads them but doesn't need them; stage 2
+trains the planner against them. Defaults to (neutral, default, 1.0) when
+metadata is missing — keeps the dataset backwards-compatible with v3/v4 callers.
 """
 import json
 import random
@@ -9,6 +14,27 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
+
+
+# Canonical mappings — keep stable across stage 1 logging and stage 2 training.
+# Emotion ids cover ESD's 5-way + LibriSpeech HuBERT-tagged neu fallback.
+EMOTION_TO_ID = {"neutral": 0, "happy": 1, "sad": 2, "angry": 3, "surprise": 4}
+ID_TO_EMOTION = {v: k for k, v in EMOTION_TO_ID.items()}
+N_EMOTIONS = len(EMOTION_TO_ID)
+
+# Style ids cover Expresso's 7-way + "default" fallback for non-Expresso.
+STYLE_TO_ID = {
+    "default": 0, "narrative": 1, "enunciated": 2, "whisper": 3,
+    "laughing": 4, "sad": 5, "happy": 6,
+}
+ID_TO_STYLE = {v: k for k, v in STYLE_TO_ID.items()}
+N_STYLES = len(STYLE_TO_ID)
+
+
+def _label_to_id(label: str, table: dict, default_id: int = 0) -> int:
+    """Map a label string to its id; unknown labels → default_id."""
+    if not label: return default_id
+    return table.get(label.lower().strip(), default_id)
 
 
 class TTSDatasetRVQ(Dataset):
@@ -21,11 +47,22 @@ class TTSDatasetRVQ(Dataset):
         vocab_path: str = None,
         max_frames: int = 800,
         preload: bool = False,
+        metadata_path: str = None,
     ):
         self.features_dir = Path(features_dir)
         self.max_frames = max_frames
         self.preload = preload
         self._cache = {}
+
+        # Optional v5 metadata (emotion/style/intensity per utterance)
+        self.metadata = {}
+        if metadata_path and Path(metadata_path).exists():
+            with open(metadata_path) as f:
+                self.metadata = json.load(f)
+            print(f"Loaded metadata for {len(self.metadata)} utterances from {metadata_path}")
+        elif metadata_path:
+            print(f"WARNING: metadata_path={metadata_path} not found — using defaults "
+                  f"(neutral/default/intensity=1.0) for all utterances")
 
         with open(phonemes_path) as f:
             self.phoneme_data = json.load(f)
@@ -75,6 +112,14 @@ class TTSDatasetRVQ(Dataset):
     def __len__(self):
         return len(self.utt_ids)
 
+    def _metadata_for(self, utt_id: str):
+        """Return (emotion_id, style_id, intensity) for an utterance, with defaults."""
+        m = self.metadata.get(utt_id, {})
+        emo_id   = _label_to_id(m.get("emotion_label", "neutral"), EMOTION_TO_ID, 0)
+        sty_id   = _label_to_id(m.get("style_label",   "default"), STYLE_TO_ID,   0)
+        intensity = float(m.get("intensity", 1.0))
+        return emo_id, sty_id, intensity
+
     def __getitem__(self, idx):
         utt_id = self.utt_ids[idx]
 
@@ -123,12 +168,17 @@ class TTSDatasetRVQ(Dataset):
                         durations[i] += diff
                         break
 
+        emo_id, sty_id, intensity = self._metadata_for(utt_id)
+
         return {
             "phoneme_ids": torch.tensor(phoneme_indices, dtype=torch.long),
             "durations": torch.tensor(durations, dtype=torch.float32),
             "vq_tokens": torch.tensor(vq_tokens, dtype=torch.long),  # (T, K)
             "speaker_emb": torch.from_numpy(spk_emb),
             "style_features": torch.from_numpy(style_features),  # (T, 14)
+            "emotion_id": torch.tensor(emo_id, dtype=torch.long),
+            "style_id":   torch.tensor(sty_id, dtype=torch.long),
+            "intensity":  torch.tensor(intensity, dtype=torch.float32),
             "utt_id": utt_id,
         }
 
@@ -199,6 +249,14 @@ def collate_tts_rvq(batch):
         frame_mask[i, :flen] = True
         style_features[i, :slen] = b["style_features"]
 
+    # v5 metadata: emotion/style/intensity stacks (defaults present even if metadata absent)
+    emotion_ids = torch.stack([b["emotion_id"] for b in batch]) \
+        if "emotion_id" in batch[0] else torch.zeros(B, dtype=torch.long)
+    style_ids   = torch.stack([b["style_id"]   for b in batch]) \
+        if "style_id"   in batch[0] else torch.zeros(B, dtype=torch.long)
+    intensities = torch.stack([b["intensity"]  for b in batch]) \
+        if "intensity"  in batch[0] else torch.ones(B, dtype=torch.float32)
+
     return {
         "phoneme_ids": phoneme_ids,
         "phoneme_mask": phoneme_mask,
@@ -207,4 +265,7 @@ def collate_tts_rvq(batch):
         "frame_mask": frame_mask,
         "speaker_embs": speaker_embs,
         "style_features": style_features,  # (B, T_max, 14)
+        "emotion_ids": emotion_ids,        # (B,)
+        "style_ids":   style_ids,          # (B,)
+        "intensities": intensities,        # (B,)
     }
