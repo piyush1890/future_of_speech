@@ -28,6 +28,8 @@ git log -1 --oneline --decorate
 - `dialogue_dataset_tool/README.md`: one-command dialogue dataset builder notes.
 - `data/*training_upload*/README.md`: small tracked notes for ignored dataset
   upload packages; the dataset payloads remain intentionally ignored.
+- `data/*.py`: small preprocessing/alignment source helpers tracked
+  intentionally even though most of `data/` is ignored.
 
 ## Local Artifacts Not In Git
 
