@@ -26,6 +26,8 @@ git log -1 --oneline --decorate
 - `v8/README.md`: v8 design notes.
 - `docs/*.excalidraw`: dataset and VibeVoice pipeline diagrams.
 - `dialogue_dataset_tool/README.md`: one-command dialogue dataset builder notes.
+- `data/*training_upload*/README.md`: small tracked notes for ignored dataset
+  upload packages; the dataset payloads remain intentionally ignored.
 
 ## Local Artifacts Not In Git
 
