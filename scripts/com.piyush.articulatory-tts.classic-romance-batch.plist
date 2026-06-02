@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.piyush.articulatory-tts.classic-romance-batch</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/piyush/projects/articulatory-tts/.venv_dialogue_dataset/bin/python</string>
+    <string>/Users/piyush/projects/articulatory-tts/scripts/run_overnight_classic_romance_movies.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/piyush/projects/articulatory-tts</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTORCH_ENABLE_MPS_FALLBACK</key>
+    <string>0</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/piyush/projects/articulatory-tts/data/batch_logs/classic_romance_overnight/launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/piyush/projects/articulatory-tts/data/batch_logs/classic_romance_overnight/launchd.err.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

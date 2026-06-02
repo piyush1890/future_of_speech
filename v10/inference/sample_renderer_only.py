@@ -32,6 +32,10 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--cfg-scale", type=float, default=1.0)
+    ap.add_argument("--eop-threshold", type=float, default=0.5,
+                    help="EOP firing threshold. Focal-loss-trained models are "
+                         "calibrated → 0.5 works. Legacy pos-weighted-BCE models "
+                         "need ~0.8 (set explicitly).")
     ap.add_argument("--max-frames", type=int, default=600)
     ap.add_argument("--output", default="v10/outputs/renderer_e1.wav")
     args = ap.parse_args()
@@ -99,6 +103,7 @@ def main():
         renderer, batch["phoneme_ids"], style_codes, batch["spk_emb"], batch["knobs"],
         batch["phoneme_mask"], max_frames=args.max_frames,
         temperature=args.temperature, cfg_scale=args.cfg_scale,
+        eop_threshold=args.eop_threshold,
     )
     n_frames = gen["n_frames"]
     eops_fired = int(gen["eop"].sum().item())

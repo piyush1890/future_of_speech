@@ -5,6 +5,11 @@ data/
 checkpoints/
 checkpoints_*/
 
+# Downloaded model caches (recreated by bootstrap scripts; too large for git)
+models/mlx-audio-separator/
+models/mlx-whisper-large-v3-turbo/
+models/speechbrain-spkrec-ecapa-voxceleb/
+
 # Generated audio samples
 outputs/
 
@@ -23,6 +28,7 @@ __pycache__/
 
 # Env
 .venv/
+.venv_dialogue_dataset/
 venv/
 env/
 .env

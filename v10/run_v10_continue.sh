@@ -51,6 +51,7 @@ run_step "03_stage1_renderer" \
         --frame-codes-dir v10/data/frame_codes \
         --tokenizer-checkpoint v10/checkpoints/tokenizer/best.pt \
         --vec-weight 0.5 \
+        --eop-loss-type focal --eop-weight 10.0 \
         --checkpoint-dir v10/checkpoints/stage1_renderer
 
 # ─── Step 4: extract style codes ─────────────────────────────────────────

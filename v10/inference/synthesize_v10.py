@@ -165,7 +165,10 @@ def main():
     ap.add_argument("--cfg-scale", type=float, default=1.0)
     ap.add_argument("--planner-temperature", type=float, default=1.0)
     ap.add_argument("--planner-cfg-scale", type=float, default=1.0)
-    ap.add_argument("--eop-threshold", type=float, default=0.5)
+    ap.add_argument("--eop-threshold", type=float, default=0.5,
+                    help="EOP firing threshold. Focal-loss-trained models are "
+                         "calibrated → 0.5 works. Legacy pos-weighted-BCE models "
+                         "need ~0.8 (set explicitly).")
     ap.add_argument("--max-frames", type=int, default=600)
     ap.add_argument("--frame-stride", type=int, default=1,
                     help="Native:tokenized rate ratio (must match training). "

@@ -38,8 +38,30 @@ def cosine_with_warmup(step, warmup, total):
     return 0.5 * (1.0 + math.cos(math.pi * min(1.0, p)))
 
 
+def focal_loss_with_logits(logits, targets, alpha=0.75, gamma=2.0):
+    """Sigmoid focal loss. Produces calibrated probabilities (unlike pos-weighted
+    BCE), so threshold=0.5 at inference just works regardless of class imbalance.
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    p_t = p if target=1 else 1-p
+    alpha_t = alpha if target=1 else 1-alpha
+
+    alpha=0.75 modestly upweights positives (rare class).
+    gamma=2.0 (Lin et al. RetinaNet default) downweights easy examples.
+    """
+    p = torch.sigmoid(logits)
+    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t = p * targets + (1 - p) * (1 - targets)
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    focal_weight = alpha_t * (1 - p_t).pow(gamma)
+    return focal_weight * ce
+
+
 def compute_losses(style_out, render_out, batch, K: int, level_w, codebooks=None,
-                   ce_lev_const: float = 1.0):
+                   ce_lev_const: float = 1.0,
+                   eop_loss_type: str = "focal",
+                   eop_focal_alpha: float = 0.75,
+                   eop_focal_gamma: float = 2.0):
     """Returns dict of scalar losses.
 
     codebooks: optional list of K tensors (codebook_size, D). When provided,
@@ -90,14 +112,23 @@ def compute_losses(style_out, render_out, batch, K: int, level_w, codebooks=None
     vec_total = (sum(level_w[k] * vec_levels[k] for k in range(K))
                  if codebooks is not None else None)
 
-    # EOP BCE with pos-weighting (negatives:positives = avg_phoneme_len - 1)
-    n_pos = (body_dur > 0).float().sum().clamp(min=1.0)
-    n_frames = body_dur.float().sum().clamp(min=1.0)
-    pos_weight = ((n_frames - n_pos) / n_pos).clamp(min=1.0)
-    pos_weight = pos_weight.detach()
-    eop_loss_per = F.binary_cross_entropy_with_logits(
-        eop_logit, eop, reduction="none", pos_weight=pos_weight,
-    )
+    # EOP loss: focal loss (default) or pos-weighted BCE.
+    # Focal loss produces calibrated probabilities so inference threshold=0.5
+    # just works. Pos-weighted BCE produces biased probabilities that need
+    # tuning per dataset.
+    if eop_loss_type == "focal":
+        eop_loss_per = focal_loss_with_logits(
+            eop_logit, eop, alpha=eop_focal_alpha, gamma=eop_focal_gamma,
+        )
+        pos_weight = 0.0   # not used; logged for compatibility
+    else:
+        n_pos = (body_dur > 0).float().sum().clamp(min=1.0)
+        n_frames = body_dur.float().sum().clamp(min=1.0)
+        pw = ((n_frames - n_pos) / n_pos).clamp(min=1.0).detach()
+        eop_loss_per = F.binary_cross_entropy_with_logits(
+            eop_logit, eop, reduction="none", pos_weight=pw,
+        )
+        pos_weight = pw.item() if hasattr(pw, "item") else float(pw)
     eop_loss = (eop_loss_per * fmask).sum() / denom
 
     commit = style_out["commit_loss"]
@@ -110,7 +141,7 @@ def compute_losses(style_out, render_out, batch, K: int, level_w, codebooks=None
         "vec_per_level": vec_levels if codebooks is not None else None,
         "eop_loss": eop_loss,
         "commit": commit,
-        "pos_weight": pos_weight.item() if hasattr(pos_weight, "item") else float(pos_weight),
+        "pos_weight": pos_weight,
     }
 
 
@@ -136,11 +167,23 @@ def main():
     p.add_argument("--tokenizer-checkpoint", default="v10/checkpoints/tokenizer/best.pt",
                    help="Path to tokenizer best.pt — used to extract codebooks for vec loss.")
     p.add_argument("--eop-weight", type=float, default=0.5)
+    p.add_argument("--eop-loss-type", default="focal", choices=["focal", "bce"],
+                   help="focal: well-calibrated probabilities (threshold 0.5 just works). "
+                        "bce: pos-weighted BCE (legacy; needs threshold tuning at inference).")
+    p.add_argument("--eop-focal-alpha", type=float, default=0.75)
+    p.add_argument("--eop-focal-gamma", type=float, default=2.0)
     p.add_argument("--commit-weight", type=float, default=0.25)
     p.add_argument("--vec-weight", type=float, default=0.5,
                    help="Weight for vector-distance loss (rewards predicting tokens "
                         "close to GT in codebook vector space). 0 disables.")
     p.add_argument("--level-weights", default="1.0,0.7,0.5,0.4")
+    p.add_argument("--ss-max-prob", type=float, default=0.3,
+                   help="Scheduled sampling max probability. Per-frame Bernoulli "
+                        "of replacing GT prev-token with model's argmax during training. "
+                        "0 disables. Reduces AR exposure bias.")
+    p.add_argument("--ss-warmup-epochs", type=int, default=4,
+                   help="Linearly anneal scheduled-sampling prob from 0 to ss-max-prob "
+                        "over this many epochs.")
     p.add_argument("--val-frac", type=float, default=0.02)
     p.add_argument("--preload", action="store_true")
     p.add_argument("--num-workers", type=int, default=0)
@@ -242,13 +285,40 @@ def main():
             n_total = batch["phoneme_ids"].shape[1]
             style_out = style_enc(batch["frames"], batch["frame_mask"],
                                   batch["frame_to_enc_pos"], n_total=n_total)
+
+            # Scheduled sampling: anneal p_ss from 0 to ss_max over warmup epochs.
+            # First pass with GT codes (teacher forced) → take argmax → mix into
+            # decoder input for second pass. Trains the model to recover from
+            # its own errors at inference (reduces AR exposure bias).
+            ss_p = args.ss_max_prob * min(1.0, (epoch - 1) / max(1, args.ss_warmup_epochs - 1))
+            if ss_p > 0:
+                with torch.no_grad():
+                    out_tf = renderer(
+                        batch["phoneme_ids"], style_out["codes"], batch["spk_emb"],
+                        batch["knobs"], batch["phoneme_mask"],
+                        batch["frame_codes"], batch["frame_to_enc_pos"], batch["frame_mask"],
+                    )
+                    pred_codes = out_tf["frame_logits"].argmax(-1)        # (B, T, K)
+                    # per-frame Bernoulli mask
+                    fc = batch["frame_codes"]
+                    ss_mask = torch.bernoulli(
+                        torch.full(fc.shape[:2], ss_p, device=fc.device)
+                    ).bool().unsqueeze(-1)
+                    mixed_codes = torch.where(ss_mask, pred_codes, fc)
+                input_codes = mixed_codes
+            else:
+                input_codes = batch["frame_codes"]
+
             render_out = renderer(
                 batch["phoneme_ids"], style_out["codes"], batch["spk_emb"],
                 batch["knobs"], batch["phoneme_mask"],
-                batch["frame_codes"], batch["frame_to_enc_pos"], batch["frame_mask"],
+                input_codes, batch["frame_to_enc_pos"], batch["frame_mask"],
             )
             losses = compute_losses(style_out, render_out, batch, args.num_quantizers,
-                                    level_w, codebooks=codebooks)
+                                    level_w, codebooks=codebooks,
+                                    eop_loss_type=args.eop_loss_type,
+                                    eop_focal_alpha=args.eop_focal_alpha,
+                                    eop_focal_gamma=args.eop_focal_gamma)
             total = losses["ce_total"] + args.eop_weight * losses["eop_loss"] \
                   + args.commit_weight * losses["commit"]
             if losses["vec_total"] is not None:
@@ -275,6 +345,7 @@ def main():
                 "acc0": f"{acc_per[0]*100:.0f}%",
                 "eop": f"{losses['eop_loss'].item():.2f}",
                 **({"vec": f"{vec_val:.2f}"} if vec_val is not None else {}),
+                **({"ss": f"{ss_p:.2f}"} if ss_p > 0 else {}),
             })
             if step % args.log_every == 0:
                 rec = {"type": "step", "step": step, "lr": lr,
@@ -347,6 +418,7 @@ def main():
                 "args": vars(args), "epoch": epoch,
                 "val_ce": v["ce_total"], "val_eop": v["eop"]}
         torch.save(ckpt, out_dir / "last.pt")
+        torch.save(ckpt, out_dir / f"epoch_{epoch:02d}.pt")  # archived per-epoch
         if v["ce_total"] < best_val:
             best_val = v["ce_total"]
             torch.save(ckpt, out_dir / "best.pt")
